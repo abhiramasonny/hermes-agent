@@ -168,6 +168,103 @@ test('writeSecretFileAtomic creates the file owner-only, not at the 0644 umask d
   })
 })
 
+test('writeSecretFileAtomic does not inherit loose bits from a stale temp file', () => {
+  // renameSync keeps the TEMP file's permissions, and writeFileSync's `mode`
+  // is ignored when the path already exists — so a temp left by a crashed
+  // earlier write would otherwise hand 0644 straight to the target.
+  withTempDir(dir => {
+    const target = path.join(dir, 'connection.json')
+    fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
+    assert.notEqual(modeOf(`${target}.tmp`), SECRET_FILE_MODE)
+
+    writeSecretFileAtomic(target, 'fresh')
+
+    assert.equal(modeOf(target), SECRET_FILE_MODE)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'fresh')
+  })
+})
+
+/**
+ * Owner-only is carried by two independent mechanisms — the create-time `mode`
+ * and the chmod before the rename — because each covers a case the other
+ * cannot. The next two tests knock out one mechanism at a time (with the REAL
+ * fs doing the actual write, so the assertion is still the on-disk mode) and
+ * require the survivor to hold the line on its own. Without them, either
+ * mechanism could be deleted with every test still green.
+ */
+function fsWith(overrides: Record<string, unknown>) {
+  return { ...fs, ...overrides } as any
+}
+
+test('the written file is owner-only even where chmod does nothing', () => {
+  // Windows, and any mount that refuses chmod. The create-time `mode` is what
+  // covers this — there is no second chance to tighten.
+  withTempDir(dir => {
+    const target = path.join(dir, 'connection.json')
+    // Pin a permissive umask so a mode-less create WOULD land
+    // group/other-readable — otherwise a restrictive-umask host could pass this
+    // for free. Synchronous and restored in `finally`, and the electron project
+    // runs one process per file, so no other test observes it.
+    const previousUmask = process.umask(0o022)
+
+    try {
+      const witness = path.join(dir, 'witness.json')
+      fs.writeFileSync(witness, 'x')
+      assert.notEqual(modeOf(witness), SECRET_FILE_MODE, 'the ambient default is NOT already owner-only')
+
+      writeSecretFileAtomic(target, 'tok', { fs: fsWith({ chmodSync: () => void 0 }) })
+    } finally {
+      process.umask(previousUmask)
+    }
+
+    assert.equal(modeOf(target), SECRET_FILE_MODE, 'created owner-only, not tightened after the fact')
+  })
+})
+
+test('the written file is owner-only even when a stale temp cannot be removed', () => {
+  // The unlink is best-effort; if the stale temp survives, writeFileSync's
+  // `mode` is ignored on an existing path and only the chmod before the rename
+  // can still fix the bits.
+  withTempDir(dir => {
+    const target = path.join(dir, 'connection.json')
+    fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
+
+    writeSecretFileAtomic(target, 'tok', { fs: fsWith({ rmSync: () => void 0 }) })
+
+    assert.equal(modeOf(target), SECRET_FILE_MODE, 'tightened before the rename handed the bits over')
+    assert.equal(fs.readFileSync(target, 'utf8'), 'tok')
+  })
+})
+
+test('writeSecretFileAtomic cannot be redirected through a symlink planted at the temp path', () => {
+  // A stale temp path is attacker-controllable in a shared temp/userData dir.
+  // Following it would write the token into the victim file AND then rename the
+  // link over connection.json, so every later write leaks too.
+  withTempDir(dir => {
+    const target = path.join(dir, 'connection.json')
+    const victim = path.join(dir, 'victim.txt')
+    fs.writeFileSync(victim, 'original', { mode: 0o644 })
+
+    try {
+      fs.symlinkSync(victim, `${target}.tmp`, 'file')
+    } catch (error: any) {
+      if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+        return
+      }
+
+      throw error
+    }
+
+    writeSecretFileAtomic(target, 'tok-live-42')
+
+    assert.equal(fs.readFileSync(victim, 'utf8'), 'original', 'the symlink target was not written through')
+    assert.equal(modeOf(victim), 0o644, 'the victim file was not chmodded either')
+    assert.equal(fs.readFileSync(target, 'utf8'), 'tok-live-42')
+    assert.equal(fs.lstatSync(target).isSymbolicLink(), false, 'the target is a real file, not the planted link')
+    assert.equal(modeOf(target), SECRET_FILE_MODE)
+  })
+})
+
 test('encryptDesktopSecret allows plain-text opt-in when encryption is unavailable', () => {
   const secret = encryptDesktopSecret(
     'token',
@@ -379,102 +476,6 @@ test('resolvePersistedRemoteToken keeps the existing token when no new token is 
     existingToken
   )
   assert.equal(called, false, 'an empty incoming token must not re-encrypt anything')
-
-test('writeSecretFileAtomic does not inherit loose bits from a stale temp file', () => {
-  // renameSync keeps the TEMP file's permissions, and writeFileSync's `mode`
-  // is ignored when the path already exists — so a temp left by a crashed
-  // earlier write would otherwise hand 0644 straight to the target.
-  withTempDir(dir => {
-    const target = path.join(dir, 'connection.json')
-    fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
-    assert.notEqual(modeOf(`${target}.tmp`), SECRET_FILE_MODE)
-
-    writeSecretFileAtomic(target, 'fresh')
-
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
-    assert.equal(fs.readFileSync(target, 'utf8'), 'fresh')
-  })
-})
-
-/**
- * Owner-only is carried by two independent mechanisms — the create-time `mode`
- * and the chmod before the rename — because each covers a case the other
- * cannot. The next two tests knock out one mechanism at a time (with the REAL
- * fs doing the actual write, so the assertion is still the on-disk mode) and
- * require the survivor to hold the line on its own. Without them, either
- * mechanism could be deleted with every test still green.
- */
-function fsWith(overrides: Record<string, unknown>) {
-  return { ...fs, ...overrides } as any
-}
-
-test('the written file is owner-only even where chmod does nothing', () => {
-  // Windows, and any mount that refuses chmod. The create-time `mode` is what
-  // covers this — there is no second chance to tighten.
-  withTempDir(dir => {
-    const target = path.join(dir, 'connection.json')
-    // Pin a permissive umask so a mode-less create WOULD land
-    // group/other-readable — otherwise a restrictive-umask host could pass this
-    // for free. Synchronous and restored in `finally`, and the electron project
-    // runs one process per file, so no other test observes it.
-    const previousUmask = process.umask(0o022)
-
-    try {
-      const witness = path.join(dir, 'witness.json')
-      fs.writeFileSync(witness, 'x')
-      assert.notEqual(modeOf(witness), SECRET_FILE_MODE, 'the ambient default is NOT already owner-only')
-
-      writeSecretFileAtomic(target, 'tok', { fs: fsWith({ chmodSync: () => void 0 }) })
-    } finally {
-      process.umask(previousUmask)
-    }
-
-    assert.equal(modeOf(target), SECRET_FILE_MODE, 'created owner-only, not tightened after the fact')
-  })
-})
-
-test('the written file is owner-only even when a stale temp cannot be removed', () => {
-  // The unlink is best-effort; if the stale temp survives, writeFileSync's
-  // `mode` is ignored on an existing path and only the chmod before the rename
-  // can still fix the bits.
-  withTempDir(dir => {
-    const target = path.join(dir, 'connection.json')
-    fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
-
-    writeSecretFileAtomic(target, 'tok', { fs: fsWith({ rmSync: () => void 0 }) })
-
-    assert.equal(modeOf(target), SECRET_FILE_MODE, 'tightened before the rename handed the bits over')
-    assert.equal(fs.readFileSync(target, 'utf8'), 'tok')
-  })
-})
-
-test('writeSecretFileAtomic cannot be redirected through a symlink planted at the temp path', () => {
-  // A stale temp path is attacker-controllable in a shared temp/userData dir.
-  // Following it would write the token into the victim file AND then rename the
-  // link over connection.json, so every later write leaks too.
-  withTempDir(dir => {
-    const target = path.join(dir, 'connection.json')
-    const victim = path.join(dir, 'victim.txt')
-    fs.writeFileSync(victim, 'original', { mode: 0o644 })
-
-    try {
-      fs.symlinkSync(victim, `${target}.tmp`, 'file')
-    } catch (error: any) {
-      if (error?.code === 'EPERM' || error?.code === 'EACCES') {
-        return
-      }
-
-      throw error
-    }
-
-    writeSecretFileAtomic(target, 'tok-live-42')
-
-    assert.equal(fs.readFileSync(victim, 'utf8'), 'original', 'the symlink target was not written through')
-    assert.equal(modeOf(victim), 0o644, 'the victim file was not chmodded either')
-    assert.equal(fs.readFileSync(target, 'utf8'), 'tok-live-42')
-    assert.equal(fs.lstatSync(target).isSymbolicLink(), false, 'the target is a real file, not the planted link')
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
-  })
 })
 
 test('tightenSecretFileMode tightens a pre-existing world-readable config in place', () => {
